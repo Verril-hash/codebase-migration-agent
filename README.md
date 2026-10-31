@@ -56,6 +56,10 @@ pytest                            # the skeleton tests should pass
 migrate --help
 ```
 
+Using Claude Code? It reads [`CLAUDE.md`](CLAUDE.md) automatically: open a
+session in the repo and ask it to "set up the project". `CLAUDE.md` also tells it
+who owns which module and the rules every change must follow.
+
 ## Plan
 
 | Week | Goal | Everyone |

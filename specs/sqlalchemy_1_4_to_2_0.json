@@ -1,0 +1,29 @@
+{
+  "spec_id": "sqlalchemy-1.4-to-2.0",
+  "title": "SQLAlchemy 1.4 to 2.0",
+  "target_version": "2.0",
+  "deprecated_patterns": [
+    {
+      "pattern_id": "declarative_base_import",
+      "ast_matcher": "sqlalchemy.ext.declarative.declarative_base",
+      "description": "declarative_base moved to sqlalchemy.orm"
+    },
+    {
+      "pattern_id": "engine_execute",
+      "ast_matcher": "sqlalchemy.engine.Engine.execute",
+      "description": "Engine.execute() was removed; use a Connection"
+    },
+    {
+      "pattern_id": "session_query",
+      "ast_matcher": "sqlalchemy.orm.Session.query",
+      "description": "legacy Query API; use select() with Session.execute()"
+    }
+  ],
+  "replacement_rules": [
+    {"pattern_id": "declarative_base_import", "strategy": "codemod", "ref": "sqla_declarative_base"},
+    {"pattern_id": "engine_execute", "strategy": "llm", "ref": "sqla_engine_execute"},
+    {"pattern_id": "session_query", "strategy": "llm", "ref": "sqla_session_query"}
+  ],
+  "oracle": "sqlalchemy_text_oracle",
+  "_note": "Starting example. Adithya (Module 1 and 5) owns this file and completes the pattern list."
+}

@@ -1,0 +1,4 @@
+# Store every text file with LF endings, whatever the contributor's OS.
+* text=auto eol=lf
+*.pdf binary
+*.png binary

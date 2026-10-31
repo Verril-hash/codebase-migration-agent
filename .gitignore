@@ -1,0 +1,26 @@
+# Secrets: never commit
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+
+# Run output (keep only results that the report cites, under results/)
+runs/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

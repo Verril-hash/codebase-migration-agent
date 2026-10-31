@@ -1,0 +1,29 @@
+# Owners are asked to review pull requests that touch their paths.
+# The last matching line wins. See CONTRIBUTORS.md.
+
+*                                       @Verril-hash
+
+# Shared contract: every owner reviews
+/src/migration_agent/models.py          @Verril-hash @mradinax @prajwal-tech07 @prabanjan-ux
+
+# Verril: M2, M3, agent loop
+/src/migration_agent/analysis/          @Verril-hash
+/src/migration_agent/planning/          @Verril-hash
+/src/migration_agent/agent.py           @Verril-hash
+
+# Adithya: M1, M5, specs
+/src/migration_agent/spec/              @mradinax @Verril-hash
+/src/migration_agent/cli.py             @mradinax @Verril-hash
+/src/migration_agent/editing/           @mradinax @Verril-hash
+/specs/                                 @mradinax @Verril-hash
+
+# Prajwal: M6, M7, LLM client
+/src/migration_agent/sandbox/           @prajwal-tech07 @Verril-hash
+/src/migration_agent/correction/        @prajwal-tech07 @Verril-hash
+/src/migration_agent/llm/               @prajwal-tech07 @Verril-hash
+
+# Prabanjan: M4, M8, M9, corpus format
+/src/migration_agent/memory/            @prabanjan-ux @Verril-hash
+/src/migration_agent/trajectory/        @prabanjan-ux @Verril-hash
+/src/migration_agent/benchmark/         @prabanjan-ux @Verril-hash
+/corpus/README.md                       @prabanjan-ux @Verril-hash

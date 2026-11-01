@@ -15,6 +15,8 @@ from migration_agent.analysis.imports import ImportGraphBuilder
 from migration_agent.analysis.matcher import CallSiteMatcher
 from migration_agent.analysis.oracle import OracleDetector
 from migration_agent.analysis.parser import SourceParser
+from migration_agent.analysis.py2 import AVAILABLE as PY2_AVAILABLE
+from migration_agent.analysis.py2 import python2_fallback
 from migration_agent.analysis.scanner import RepositoryScanner
 from migration_agent.analysis.symbols import SymbolTable
 from migration_agent.models import AnalysisResult, MigrationSpec
@@ -39,7 +41,8 @@ class StaticAnalyzer:
         Raises ``ValueError`` when no file in the repository could be parsed.
         """
         paths = RepositoryScanner(self.repo_path, self.excludes).scan()
-        modules, failures = SourceParser(self.repo_path).parse_all(paths)
+        fallback = python2_fallback if PY2_AVAILABLE else None
+        modules, failures = SourceParser(self.repo_path, fallback).parse_all(paths)
         if not modules:
             raise ValueError(f"no parsable source files in {self.repo_path}")
 

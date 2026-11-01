@@ -3,7 +3,9 @@
 Owner: Verril (Module 2). Design: Module 2 detailed design, class CallSiteMatcher
 and figure 3 (call-site resolution flowchart).
 
-A call matches when its qualified callee equals a pattern. A call that might be
+A call matches when its qualified callee equals a pattern. A deprecated name
+used without being called (``make = sessionmaker``, a callback list) matches
+too: it has to be migrated just the same. A call that might be
 deprecated but cannot be resolved is not dropped: it becomes an
 :class:`UnresolvedSite` with a reason, so the verification loop can catch it:
 
@@ -20,7 +22,7 @@ import ast
 
 from migration_agent.analysis import knowledge
 from migration_agent.analysis.parser import ParsedModule
-from migration_agent.analysis.scopes import CallInfo, ScopeWalker
+from migration_agent.analysis.scopes import CALL, CallInfo, ScopeWalker
 from migration_agent.analysis.symbols import SymbolTable
 from migration_agent.models import CallSite, DeprecatedPattern, UnresolvedReason, UnresolvedSite
 
@@ -55,6 +57,8 @@ class CallSiteMatcher:
                         pattern_id=pattern.pattern_id,
                     )
                 )
+                continue
+            if call.kind != CALL:
                 continue
             reason = self._unresolved_reason(call)
             if reason is not None:

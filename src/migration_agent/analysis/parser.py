@@ -35,6 +35,8 @@ class ParsedModule:
     is_package: bool  # True for an __init__.py
     #: Names a package exports explicitly through ``__all__``, when it defines one.
     all_names: list[str] | None = field(default=None)
+    #: True when only the fallback parser could read the file (Python 2 source).
+    python2: bool = False
 
 
 def module_name(relative_path: str, root: Path) -> str:
@@ -79,6 +81,7 @@ class SourceParser:
             data = (self.root / path).read_bytes()
         except OSError as error:
             return ParseFailure(path, f"unreadable: {error}")
+        python2 = False
         try:
             tree = ast.parse(data, filename=path)
         except (SyntaxError, ValueError) as error:
@@ -86,6 +89,7 @@ class SourceParser:
                 return ParseFailure(path, f"syntax error: {error}")
             try:
                 tree = self.fallback(data, path)
+                python2 = True
             except (SyntaxError, ValueError) as fallback_error:
                 return ParseFailure(path, f"syntax error (fallback too): {fallback_error}")
         return ParsedModule(
@@ -95,6 +99,7 @@ class SourceParser:
             source_hash=hashlib.sha256(data).hexdigest(),
             is_package=Path(path).name == "__init__.py",
             all_names=_all_names(tree),
+            python2=python2,
         )
 
     def parse_all(self, paths: list[str]) -> tuple[dict[str, ParsedModule], list[ParseFailure]]:

@@ -11,7 +11,7 @@ Constructing an in-repo class is an edge to its ``__init__``.
 from __future__ import annotations
 
 from migration_agent.analysis.parser import ParsedModule
-from migration_agent.analysis.scopes import ScopeWalker
+from migration_agent.analysis.scopes import CALL, ScopeWalker
 from migration_agent.analysis.symbols import SymbolTable
 
 
@@ -29,7 +29,7 @@ class CallGraphBuilder:
         graph: dict[str, set[str]] = {name: set() for name in defined}
         for call in calls:
             callee = call.target
-            if callee is None:
+            if callee is None or call.kind != CALL:
                 continue
             if callee in walker.classes:
                 callee = f"{callee}.__init__"

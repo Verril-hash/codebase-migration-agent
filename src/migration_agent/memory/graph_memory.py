@@ -18,6 +18,7 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
+from migration_agent.analysis.parser import module_name
 from migration_agent.models import (
     AnalysisResult,
     CallSite,
@@ -56,11 +57,18 @@ def hash_content(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _module_names(paths: Iterable[str]) -> dict[str, str]:
-    """Dotted module name -> file path, e.g. ``app.db`` -> ``app/db.py``."""
+def _module_names(paths: Iterable[str], repo_root: Path | None = None) -> dict[str, str]:
+    """Dotted module name -> file path, e.g. ``app.db`` -> ``app/db.py``.
+
+    With ``repo_root`` the names follow Module 2 (package folders only, so
+    ``src/app/db.py`` is ``app.db``); without it they come from the path alone.
+    """
     names: dict[str, str] = {}
     for path in paths:
         if not path.endswith(".py"):
+            continue
+        if repo_root is not None:
+            names[module_name(path, repo_root)] = path
             continue
         parts = path[:-3].split("/")
         if parts[-1] == "__init__":
@@ -110,11 +118,12 @@ class GraphMemory:
         files.update(site.file for site in analysis.call_sites)
         files.update(site.file for site in analysis.unresolved_sites)
         files.update(analysis.impact_set.files)
+        files.update(failure.file for failure in analysis.parse_failures)
 
         edges: dict[str, set[str]] = {path: set() for path in files}
         for source, targets in analysis.import_graph.items():
             edges[source].update(targets)
-        modules = _module_names(files)
+        modules = _module_names(files, memory.repo_root)
         for caller, callees in analysis.call_graph.items():
             source = _owning_file(caller, modules)
             for callee in callees:

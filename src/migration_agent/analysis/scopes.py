@@ -96,15 +96,25 @@ class Scope:
         return None
 
 
+CALL = "call"
+REFERENCE = "reference"
+
+
 @dataclass
 class CallInfo:
-    """One call expression, with what the walker could work out about it."""
+    """One call, or one use of a name without calling it, with what the walker worked out.
 
-    node: ast.Call
+    ``kind`` is :data:`CALL` for ``f(...)`` and :data:`REFERENCE` for a name that is
+    read but not called (``make = sessionmaker``, ``callbacks=[declarative_base]``).
+    References are only reported when they resolve to a qualified name.
+    """
+
+    node: ast.expr
     scope: Scope
     path: str
-    #: Fully qualified callee, or None when it cannot be known statically.
+    #: Fully qualified callee or referenced name, or None when it cannot be known.
     target: str | None
+    kind: str = CALL
 
 
 class ScopeWalker:
@@ -284,14 +294,31 @@ class ScopeWalker:
         return found
 
     # ------------------------------------------------------------ traversal
-    def _visit_scope(self, node: ast.AST, scope: Scope, path: str) -> Iterator[CallInfo]:
-        """Calls made directly in ``node``'s scope, then the scopes nested in it."""
-        nodes = list(walk_scope(node))
-        self._collect_types(nodes, scope)
+    def _events(self, nodes: list[ast.AST], scope: Scope, path: str) -> Iterator[CallInfo]:
+        """Calls, and resolvable names read without being called, among one scope's nodes."""
+        callees = {id(n.func) for n in nodes if isinstance(n, ast.Call)}
+        # ``a.b.c`` is one reference: skip the inner ``a`` and ``a.b`` of every chain.
+        inner = {id(n.value) for n in nodes if isinstance(n, ast.Attribute)}
         for child in nodes:
             if isinstance(child, ast.Call):
                 yield CallInfo(child, scope, path, self.qualify(child.func, scope))
-            elif isinstance(child, FUNCTIONS):
+            elif (
+                isinstance(child, ast.Name | ast.Attribute)
+                and isinstance(child.ctx, ast.Load)
+                and id(child) not in callees
+                and id(child) not in inner
+            ):
+                target = self.qualify(child, scope)
+                if target is not None:
+                    yield CallInfo(child, scope, path, target, REFERENCE)
+
+    def _visit_scope(self, node: ast.AST, scope: Scope, path: str) -> Iterator[CallInfo]:
+        """Calls and references made directly in ``node``'s scope, then nested scopes."""
+        nodes = list(walk_scope(node))
+        self._collect_types(nodes, scope)
+        yield from self._events(nodes, scope, path)
+        for child in nodes:
+            if isinstance(child, FUNCTIONS):
                 yield from self._visit_function(child, scope, path)
             elif isinstance(child, ast.ClassDef):
                 yield from self._visit_class(child, scope, path)
@@ -334,10 +361,10 @@ class ScopeWalker:
             self_types=self._self_types(cls, scope),
             class_name=class_name,
         )
-        for child in walk_scope(cls):
-            if isinstance(child, ast.Call):
-                yield CallInfo(child, body, path, self.qualify(child.func, body))
-            elif isinstance(child, FUNCTIONS):
+        nodes = list(walk_scope(cls))
+        yield from self._events(nodes, body, path)
+        for child in nodes:
+            if isinstance(child, FUNCTIONS):
                 yield from self._visit_function(child, methods, path)
             elif isinstance(child, ast.ClassDef):
                 yield from self._visit_class(child, body, path)

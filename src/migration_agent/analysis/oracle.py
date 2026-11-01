@@ -9,11 +9,26 @@ uses a different technique and shares no code with the symbol table or the
 matcher: text matching over the code with comments, strings and import
 statements blanked out.
 
-By default a pattern is counted wherever its final name appears in a file
-that mentions the pattern's top-level package (``sqlalchemy``). Where the
-final name is ambiguous (``execute`` exists on both the old ``Engine`` and the
-new ``Connection``), give the pattern an explicit regular expression through
-``regexes``; it is applied to the cleaned code.
+Each pattern is counted only in the files it can occur in (its *gate*), with a
+rule that depends on its kind:
+
+* A **method** (``sqlalchemy.orm.Session.query``, owner starts with a capital):
+  attribute uses ``.query`` in files that use the top-level package. A plain
+  variable called ``query`` is not counted.
+* A **function that moved** (``sqlalchemy.ext.declarative.declarative_base``):
+  uses of the name only in files that import from the *old* module. After
+  migration the name is still used, but imported from the new place, so it
+  correctly stops counting.
+
+A file passes a gate if it matches it, or if it imports, directly or through
+other files, a file that does. Imports are found with regular expressions,
+not the symbol table.
+
+Some names cannot be told apart as text: ``execute`` exists on the old
+``Engine`` and on the new ``Connection`` and ``Session``. Give such a pattern
+an explicit regular expression through ``regexes`` (the spec file's
+``oracle_regexes``); it replaces the counting rule and is applied to the
+cleaned code.
 """
 
 from __future__ import annotations
@@ -74,6 +89,92 @@ def clean_code(data: bytes) -> str | None:
     return "".join("".join(line) for line in chars)
 
 
+#: One import statement per line; ``[ \t]`` (not ``\s``) so a match never runs into the next line.
+_IMPORT_LINE = re.compile(
+    r"^[ \t]*(?:from[ \t]+(\.*[\w.]*)[ \t]+import[ \t]+([\w \t,.*()]+)|import[ \t]+([\w., \t]+))",
+    re.M,
+)
+
+
+def _suffix_index(files: set[str]) -> dict[str, set[str]]:
+    """Every trailing path of every file -> the files ending with it (``app/db.py``, ``db.py``)."""
+    index: dict[str, set[str]] = {}
+    for file in files:
+        parts = file.split("/")
+        for start in range(len(parts)):
+            index.setdefault("/".join(parts[start:]), set()).add(file)
+    return index
+
+
+def _imported_files(relative: str, text: str, index: dict[str, set[str]]) -> set[str]:
+    """Repository files a file imports, found with regular expressions only.
+
+    Independent of the symbol table on purpose; it may over-approximate, which
+    only makes the oracle consider a few more files.
+    """
+    package = relative.rsplit("/", 1)[0] if "/" in relative else ""
+    found: set[str] = set()
+    for match in _IMPORT_LINE.finditer(text):
+        source, names, plain = match.groups()
+        modules: list[str] = []
+        if plain:
+            modules = [part.split(" as ")[0].strip() for part in plain.split(",")]
+        elif source is not None:
+            dots = len(source) - len(source.lstrip("."))
+            base = source[dots:]
+            if dots:
+                parts = package.split("/") if package else []
+                parts = parts[: len(parts) - (dots - 1)] if dots > 1 else parts
+                prefix = "/".join(parts)
+                base = f"{prefix.replace('/', '.')}.{base}" if base else prefix.replace("/", ".")
+                base = base.strip(".")
+            modules = [base] if base else []
+            for name in re.split(r"[\s,()]+", names or ""):
+                if name and name not in {"*", "as"} and base:
+                    modules.append(f"{base}.{name}")
+        for module in modules:
+            path = module.replace(".", "/")
+            for candidate in (f"{path}.py", f"{path}/__init__.py"):
+                found |= index.get(candidate, set())
+    found.discard(relative)
+    return found
+
+
+def default_rule(ast_matcher: str) -> tuple[str, str]:
+    """``(gate, count)`` regular expressions for a pattern, by its kind (see module doc)."""
+    parts = ast_matcher.split(".")
+    final = re.escape(parts[-1])
+    if len(parts) >= 2 and parts[-2][:1].isupper():  # Class.method
+        return rf"\b{re.escape(parts[0])}\b", rf"\.{final}\b"
+    module = ".".join(parts[:-1])
+    parent, _, last = module.rpartition(".")
+    gate = rf"\b{re.escape(module)}\b"
+    if parent:  # also "from sqlalchemy.ext import declarative"
+        gate += rf"|\bfrom[ \t]+{re.escape(parent)}[ \t]+import\b[^\n]*\b{re.escape(last)}\b"
+    return gate, rf"(?<!def )(?<!class )\b{final}\b"
+
+
+def _gated(gate: str, texts: dict[str, str]) -> set[str]:
+    """Files that match ``gate``, plus files that import them, directly or not.
+
+    ``users.py`` that only does ``from app.db import SessionLocal`` never mentions
+    ``sqlalchemy`` but uses it all the same; this is the usual layout of real apps.
+    """
+    files = set(texts)
+    mention = re.compile(gate)
+    using = {f for f, text in texts.items() if mention.search(text)}
+    index = _suffix_index(files)
+    imports = {f: _imported_files(f, text, index) for f, text in texts.items()}
+    changed = True
+    while changed:
+        changed = False
+        for file in files - using:
+            if imports[file] & using:
+                using.add(file)
+                changed = True
+    return using
+
+
 class OracleDetector:
     def __init__(
         self,
@@ -82,27 +183,28 @@ class OracleDetector:
         excludes: Iterable[str] = (),
     ) -> None:
         self.excludes = tuple(excludes)
+        #: pattern id -> (gate, counting regex)
         self.rules: dict[str, tuple[str, re.Pattern[str]]] = {}
         for pattern in patterns:
-            root, _, _ = pattern.ast_matcher.partition(".")
-            final = pattern.ast_matcher.rsplit(".", 1)[-1]
-            source = (regexes or {}).get(
-                pattern.pattern_id, rf"(?<!def )(?<!class )\b{re.escape(final)}\b"
-            )
-            self.rules[pattern.pattern_id] = (root, re.compile(source))
+            gate, count = default_rule(pattern.ast_matcher)
+            count = (regexes or {}).get(pattern.pattern_id, count)
+            self.rules[pattern.pattern_id] = (gate, re.compile(count))
 
     def count_by_pattern(self, repo_path: str | Path) -> dict[str, int]:
         root = Path(repo_path)
-        counts = dict.fromkeys(self.rules, 0)
+        texts: dict[str, str] = {}
+        codes: dict[str, str] = {}
         for relative in RepositoryScanner(root, self.excludes).scan():
             data = (root / relative).read_bytes()
             code = clean_code(data)
-            if code is None:
-                continue
-            text = data.decode("utf-8", errors="replace")
-            for pattern_id, (package, regex) in self.rules.items():
-                if re.search(rf"\b{re.escape(package)}\b", text):
-                    counts[pattern_id] += len(regex.findall(code))
+            if code is not None:
+                texts[relative] = data.decode("utf-8", errors="replace")
+                codes[relative] = code
+
+        counts = dict.fromkeys(self.rules, 0)
+        for pattern_id, (gate, regex) in self.rules.items():
+            for relative in sorted(_gated(gate, texts)):
+                counts[pattern_id] += len(regex.findall(codes[relative]))
         return counts
 
     def count(self, repo_path: str | Path) -> int:

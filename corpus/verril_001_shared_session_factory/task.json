@@ -1,0 +1,23 @@
+{
+  "task_id": "verril_001_shared_session_factory",
+  "spec": "specs/sqlalchemy_1_4_to_2_0.json",
+  "author": "Verril-hash",
+  "description": "The engine and the session factory are defined once in app/db.py and imported by other modules, the usual layout of Flask and FastAPI applications.",
+  "expected_call_sites": [
+    {
+      "file": "app/models.py",
+      "line": 4,
+      "pattern_id": "declarative_base_import"
+    },
+    {
+      "file": "app/stats.py",
+      "line": 5,
+      "pattern_id": "engine_execute"
+    },
+    {
+      "file": "app/users.py",
+      "line": 14,
+      "pattern_id": "session_query"
+    }
+  ]
+}

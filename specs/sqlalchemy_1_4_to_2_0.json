@@ -25,5 +25,8 @@
     {"pattern_id": "session_query", "strategy": "llm", "ref": "sqla_session_query"}
   ],
   "oracle": "sqlalchemy_text_oracle",
+  "oracle_regexes": {
+    "engine_execute": "\\bengine\\.execute\\("
+  },
   "_note": "Starting example. Adithya (Module 1 and 5) owns this file and completes the pattern list."
 }

@@ -1,0 +1,23 @@
+{
+  "task_id": "verril_003_session_on_self",
+  "spec": "specs/sqlalchemy_1_4_to_2_0.json",
+  "author": "Verril-hash",
+  "description": "A repository class keeps its Session on self; the deprecated query calls are in methods and in a closure nested inside a method.",
+  "expected_call_sites": [
+    {
+      "file": "store/models.py",
+      "line": 4,
+      "pattern_id": "declarative_base_import"
+    },
+    {
+      "file": "store/repository.py",
+      "line": 15,
+      "pattern_id": "session_query"
+    },
+    {
+      "file": "store/repository.py",
+      "line": 19,
+      "pattern_id": "session_query"
+    }
+  ]
+}

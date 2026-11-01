@@ -1,0 +1,23 @@
+{
+  "task_id": "verril_002_aliases_and_reexports",
+  "spec": "specs/sqlalchemy_1_4_to_2_0.json",
+  "author": "Verril-hash",
+  "description": "Deprecated APIs reached through a module alias, a renamed Session re-exported by another module, and a bare reference that renames declarative_base.",
+  "expected_call_sites": [
+    {
+      "file": "shop/catalog.py",
+      "line": 7,
+      "pattern_id": "session_query"
+    },
+    {
+      "file": "shop/compat.py",
+      "line": 6,
+      "pattern_id": "declarative_base_import"
+    },
+    {
+      "file": "shop/inventory.py",
+      "line": 8,
+      "pattern_id": "session_query"
+    }
+  ]
+}

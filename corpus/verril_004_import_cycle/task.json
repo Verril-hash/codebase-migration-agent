@@ -1,0 +1,23 @@
+{
+  "task_id": "verril_004_import_cycle",
+  "spec": "specs/sqlalchemy_1_4_to_2_0.json",
+  "author": "Verril-hash",
+  "description": "Two modules import each other (one import is inside a function to avoid a load-time cycle), and both need migrating: the planner must keep them in one batch.",
+  "expected_call_sites": [
+    {
+      "file": "bank/accounts.py",
+      "line": 16,
+      "pattern_id": "session_query"
+    },
+    {
+      "file": "bank/audit.py",
+      "line": 16,
+      "pattern_id": "session_query"
+    },
+    {
+      "file": "bank/models.py",
+      "line": 4,
+      "pattern_id": "declarative_base_import"
+    }
+  ]
+}

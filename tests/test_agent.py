@@ -8,12 +8,25 @@ SQLAlchemy, Docker, Git or a language model.
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from collections.abc import Iterable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from migration_agent.agent import RunResult, Toolkit, regressed, run_migration
+from migration_agent import agent
+from migration_agent.agent import (
+    SOURCE,
+    TARGET,
+    RunResult,
+    Toolkit,
+    apply_diff,
+    new_findings,
+    regressed,
+    run_migration,
+)
 from migration_agent.memory.graph_memory import GraphMemory
 from migration_agent.models import (
     AnalysisResult,
@@ -88,9 +101,19 @@ class FakeLog:
 class World:
     """Records what the loop asked the fake tools to do."""
 
-    def __init__(self, reports: Iterable[TestReport], analysis: AnalysisResult = ANALYSIS) -> None:
-        self.reports = iter(reports)
+    def __init__(
+        self,
+        reports: Iterable[TestReport],
+        analysis: AnalysisResult = ANALYSIS,
+        lint: Iterable[list[str]] = (),
+    ) -> None:
+        self.reports = iter(reports)  # source-version runs, in order
+        self.target = GREEN  # the one run on the target version
+        self.lint_results = iter(lint)  # lint runs, in order; clean once used up
         self.analysis = analysis
+        self.stages: list[str] = []
+        self.lint_calls: list[list[str]] = []
+        self.diagnosed: list[TestReport] = []
         self.log = FakeLog()
         self.commits: list[str] = []
         self.rollbacks: list[str] = []
@@ -109,22 +132,35 @@ class World:
             plan=lambda analysis, size: PLAN,
             apply_codemod=lambda rule, path, repo: self._edit("codemod", path),
             propose_patch=lambda context, rule: self._edit("llm", context),
-            propose_fix=lambda context, fix: self._fix(fix),
+            propose_fix=lambda context, fix, repo: self._fix(fix),
             validate=lambda patch, repo: True,
             build_context=lambda memory, path, budget: path,
-            run_tests=lambda repo: next(self.reports),
+            run_tests=lambda repo, stage: self._test(stage),
+            run_lint=lambda repo, files: self._lint(files),
             checkpoint=self.checkpoint,
             rollback=lambda repo, commit: self.rollbacks.append(commit),
-            diagnose=lambda report, analysis, memory: [
-                FixRequest("api.py", "api.list_users", report.failures[0], "contract changed")
-            ],
+            diagnose=self._diagnose,
             is_oscillating=lambda history, diff: diff in history,
             new_log=lambda: self.log,
             emit_patch=lambda repo, base, out: out,
+            llm_usage=dict,
         )
         for name, value in overrides.items():
             setattr(tools, name, value)
         return tools
+
+    def _test(self, stage: str) -> TestReport:
+        self.stages.append(stage)
+        return self.target if stage == TARGET else next(self.reports)
+
+    def _lint(self, files: list[str]) -> list[str]:
+        self.lint_calls.append(list(files))
+        return next(self.lint_results, [])
+
+    def _diagnose(self, report: TestReport, analysis, memory) -> list[FixRequest]:
+        self.diagnosed.append(report)
+        failure = report.failures[0] if report.failures else TestFailure("lint", "lint", "")
+        return [FixRequest("api.py", "api.list_users", failure, "contract changed")]
 
     def _edit(self, how: str, path: str) -> Patch:
         self.edits.append((how, path))
@@ -172,7 +208,7 @@ def test_every_batch_is_edited_verified_and_logged(tmp_path: Path) -> None:
     assert result.patch_path == tmp_path / "out" / "migration.patch"
     assert world.log.saved_to == tmp_path / "out" / "trajectory.json"
     assert world.log.actions()[:3] == ["analyzed", "planned", "baseline"]
-    assert world.log.actions()[-1] == "finished"
+    assert world.log.actions()[-2:] == ["target_tested", "finished"]
     assert [e.step_id for e in world.log.entries] == list(range(1, len(world.log.entries) + 1))
     assert result.steps == len(world.log.entries)
 
@@ -276,10 +312,164 @@ def test_the_log_records_the_analysis_summary(tmp_path: Path) -> None:
     json.dumps([entry.to_dict() for entry in world.log.entries])  # serialisable for M8
 
 
-@pytest.mark.parametrize("missing", ["run_tests", "checkpoint"])
-def test_default_tools_report_the_module_that_is_missing(tmp_path: Path, missing: str) -> None:
+# ------------------------------------------------------------------ stages
+def test_batches_run_on_the_source_version_and_the_finished_run_on_the_target(
+    tmp_path: Path,
+) -> None:
     world = World([GREEN, GREEN, GREEN])
-    tools = world.toolkit()
-    setattr(tools, missing, getattr(Toolkit(), missing))  # the real, still-stubbed module
-    with pytest.raises(NotImplementedError, match="Module 6"):
-        run(world, tmp_path, tools)
+    result, _ = run(world, tmp_path)
+    assert world.stages == [SOURCE, SOURCE, SOURCE, TARGET]
+    assert result and result.target_green is True
+
+
+def test_a_regression_on_the_target_version_fails_the_run(tmp_path: Path) -> None:
+    world = World([GREEN, GREEN, GREEN])
+    world.target = red("test_api")  # passes on 1.4, fails on 2.0: a site was missed
+    result, _ = run(world, tmp_path)
+    assert not result and result.target_green is False
+    assert result.verified_batches == [0, 1]  # each batch was fine on the source version
+    final = next(e for e in world.log.entries if e.action == "target_tested")
+    assert final.status == "failed" and final.detail["regressed"] == ["test_api"]
+
+
+def test_a_test_failing_at_baseline_does_not_fail_the_target_run(tmp_path: Path) -> None:
+    world = World([red("flaky"), red("flaky"), red("flaky")])
+    world.target = red("flaky")
+    result, _ = run(world, tmp_path)
+    assert result and result.target_green is True
+
+
+def test_no_target_run_when_the_step_budget_stopped_the_run(tmp_path: Path) -> None:
+    world = World([GREEN, GREEN, GREEN])
+    result, _ = run(world, tmp_path, max_steps=3)
+    assert TARGET not in world.stages and result.target_green is None
+
+
+def test_only_regressions_are_sent_to_diagnosis(tmp_path: Path) -> None:
+    world = World([red("flaky"), red("flaky"), red("flaky", "test_api"), red("flaky")])
+    result, _ = run(world, tmp_path)
+    assert result.verified_batches == [0, 1]
+    assert [f.test_id for f in world.diagnosed[0].failures] == ["test_api"]
+
+
+# ------------------------------------------------------------------ lint
+UNDEFINED = "api.py:7:5: F821 Undefined name `select`"
+
+
+def test_lint_runs_on_the_impacted_files_then_on_each_batch_s_edits(tmp_path: Path) -> None:
+    world = World([GREEN, GREEN, GREEN])
+    run(world, tmp_path)
+    assert world.lint_calls == [["api.py", "db.py"], ["db.py"], ["api.py"]]
+
+
+def test_a_lint_finding_added_by_an_edit_is_repaired(tmp_path: Path) -> None:
+    world = World([GREEN, GREEN, GREEN, GREEN], lint=[[], [], [UNDEFINED], []])
+    result, _ = run(world, tmp_path)
+    assert result.verified_batches == [0, 1] and world.fixes == ["fix 0"]
+    assert world.diagnosed[0].lint_findings == [UNDEFINED]
+
+
+def test_a_lint_finding_that_cannot_be_repaired_rolls_the_batch_back(tmp_path: Path) -> None:
+    world = World([GREEN] * 6, lint=[[], [], [UNDEFINED], [UNDEFINED], [UNDEFINED], [UNDEFINED]])
+    result, _ = run(world, tmp_path, max_retries=3)
+    assert result.rolled_back_batches == [1] and not result
+
+
+def test_a_lint_finding_the_baseline_had_is_not_new_even_if_it_moved() -> None:
+    before = ["api.py:3:1: F821 Undefined name `x`"]
+    assert new_findings(["api.py:9:1: F821 Undefined name `x`"], before) == []
+    assert new_findings([UNDEFINED], before) == [UNDEFINED]
+
+
+# ------------------------------------------------------------------ default tools
+def test_default_run_tests_uses_the_stage_s_image(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+    monkeypatch.setattr(
+        "migration_agent.sandbox.runner.run_tests",
+        lambda repo, image=None: calls.append(image) or GREEN,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "migration_agent.sandbox.image",
+        SimpleNamespace(image_tag=lambda profile: f"sandbox:{profile}"),
+    )
+    monkeypatch.delenv("SANDBOX_SOURCE_IMAGE", raising=False)
+    monkeypatch.setenv("SANDBOX_TARGET_IMAGE", "custom:2.0")
+    Toolkit().run_tests("repo", SOURCE)
+    Toolkit().run_tests("repo", TARGET)
+    assert calls == ["sandbox:sqla-1.4", "custom:2.0"]
+
+
+def _git_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "a.py").write_text("x = session.query(User)\ny = 2\n", encoding="utf-8")
+    return repo
+
+
+# The hunk counts are wrong on purpose, as a model often writes them.
+FIX = """--- a/a.py
++++ b/a.py
+@@ -1,9 +1,9 @@
+-x = session.query(User)
++x = session.scalars(select(User))
+ y = 2
+"""
+
+
+def test_apply_diff_applies_a_model_s_diff_with_wrong_counts(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path)
+    assert apply_diff(FIX, str(repo))
+    assert (repo / "a.py").read_text(encoding="utf-8").startswith("x = session.scalars(")
+    assert not apply_diff(FIX, str(repo))  # already applied: the context no longer matches
+
+
+@pytest.fixture
+def fake_repair(monkeypatch: pytest.MonkeyPatch):
+    """Module 7 and the LLM client replaced, so no model is called."""
+
+    class LLMError(RuntimeError):
+        pass
+
+    state = SimpleNamespace(reply=None, raise_error=False)
+
+    def request_fix(client, context, fix):
+        if state.raise_error:
+            raise LLMError("rate limited")
+        return SimpleNamespace(patch=state.reply)
+
+    monkeypatch.setitem(
+        sys.modules, "migration_agent.correction.repair", SimpleNamespace(request_fix=request_fix)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "migration_agent.llm.client",
+        SimpleNamespace(LLMClient=lambda: object(), LLMError=LLMError),
+    )
+    agent._llm.cache_clear()
+    yield state
+    agent._llm.cache_clear()
+
+
+def test_default_propose_fix_applies_module_7_s_diff(tmp_path: Path, fake_repair) -> None:
+    repo = _git_repo(tmp_path)
+    fix = FixRequest("a.py", "", TestFailure("t", "boom", ""), "reason")
+    fake_repair.reply = Patch("a.py", FIX, Strategy.LLM)
+    patch = Toolkit().propose_fix("context", fix, str(repo))
+    assert patch is fake_repair.reply
+    assert "scalars" in (repo / "a.py").read_text(encoding="utf-8")
+
+
+def test_default_propose_fix_returns_none_when_there_is_no_usable_fix(
+    tmp_path: Path, fake_repair
+) -> None:
+    repo = _git_repo(tmp_path)
+    fix = FixRequest("a.py", "", TestFailure("t", "boom", ""), "reason")
+    fake_repair.reply = None  # Module 7 rejected the reply
+    assert Toolkit().propose_fix("context", fix, str(repo)) is None
+    fake_repair.reply = Patch("a.py", FIX.replace("y = 2", "z = 3"), Strategy.LLM)
+    assert Toolkit().propose_fix("context", fix, str(repo)) is None  # does not apply
+    fake_repair.raise_error = True
+    assert Toolkit().propose_fix("context", fix, str(repo)) is None  # the model call failed
+    assert "query" in (repo / "a.py").read_text(encoding="utf-8")  # nothing changed

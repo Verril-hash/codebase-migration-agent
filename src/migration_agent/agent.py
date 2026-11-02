@@ -14,8 +14,14 @@ Conventions the loop relies on:
   the change to the file and return the :class:`Patch` they made, or None when
   nothing applied. ``validate`` then checks the result.
 * Paths are repository-relative everywhere, as in ``models.py``.
-* The test suite is judged against a baseline run made before any edit, so a
-  test that already failed is not blamed on the migration.
+* Tests run in one of two stages. The baseline and every batch run on the
+  **source** version of the library (SQLAlchemy 1.4), which accepts old and new
+  style alike, so a half-migrated repository can be judged. The finished run is
+  checked once more on the **target** version (2.0). Every run is judged against
+  the baseline, so a test that already failed is not blamed on the migration,
+  and a test that passed at baseline must still pass on the target.
+* Lint must pass per batch (SDD section 7.2): a finding in an edited file that
+  the baseline did not have counts as a failure, like a test.
 * Run artifacts (graph memory, trajectory, final patch) are written to
   ``output_dir``, never inside the repository being migrated, so they cannot
   end up in its patch.
@@ -23,6 +29,11 @@ Conventions the loop relies on:
 
 from __future__ import annotations
 
+import dataclasses
+import functools
+import os
+import re
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -83,10 +94,50 @@ def _propose_patch(context: str, rule) -> Patch | None:
     return propose_patch(context, rule)
 
 
-def _propose_fix(context: str, fix) -> Patch | None:
-    from migration_agent.editing.engine import propose_fix
+@functools.cache
+def _llm():
+    """One model client per process, so its token totals cover every fix."""
+    from migration_agent.llm.client import LLMClient
 
-    return propose_fix(context, fix)
+    return LLMClient()
+
+
+def _llm_usage() -> dict[str, int]:
+    """Running totals of the shared client; empty when no model was called."""
+    if not _llm.cache_info().currsize:
+        return {}
+    client = _llm()
+    return {"calls": client.calls, "tokens_in": client.tokens_in, "tokens_out": client.tokens_out}
+
+
+def apply_diff(diff: str, repo_path: str) -> bool:
+    """Apply a unified diff to the working copy; False when it does not apply.
+
+    ``--recount`` tolerates the wrong hunk line counts a model often writes.
+    """
+    result = subprocess.run(
+        ["git", "-C", repo_path, "apply", "--recount", "--whitespace=nowarn", "-"],
+        input=diff.encode("utf-8"),
+        capture_output=True,
+        timeout=60,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def _propose_fix(context: str, fix, repo_path: str) -> Patch | None:
+    # Module 7 asks the model; the diff is applied here until Module 5 has a
+    # function for applying a model's diff (agreed on PR #14).
+    from migration_agent.correction.repair import request_fix
+    from migration_agent.llm.client import LLMError
+
+    try:
+        proposal = request_fix(_llm(), context, fix)
+    except LLMError:
+        return None
+    if proposal.patch is None or not apply_diff(proposal.patch.diff, repo_path):
+        return None
+    return proposal.patch
 
 
 def _validate(patch: Patch, repo_path: str) -> bool:
@@ -101,10 +152,32 @@ def _build_context(memory: GraphMemory, path: str, budget: int) -> str:
     return build_context(memory, path, budget)
 
 
-def _run_tests(repo_path: str) -> TestReport:
+SOURCE, TARGET = "source", "target"
+#: Sandbox profile of each stage. One migration family for now; a second one
+#: (Python 3.8 to 3.12) adds its own pair.
+STAGE_PROFILES = {SOURCE: "sqla-1.4", TARGET: "sqla-2.0"}
+
+
+def stage_image(stage: str) -> str:
+    """Image a stage runs in: ``SANDBOX_<STAGE>_IMAGE`` when set, else its profile's."""
+    override = os.environ.get(f"SANDBOX_{stage.upper()}_IMAGE", "").strip()
+    if override:
+        return override
+    from migration_agent.sandbox.image import image_tag
+
+    return image_tag(STAGE_PROFILES[stage])
+
+
+def _run_tests(repo_path: str, stage: str) -> TestReport:
     from migration_agent.sandbox.runner import run_tests
 
-    return run_tests(repo_path)
+    return run_tests(repo_path, image=stage_image(stage))
+
+
+def _run_lint(repo_path: str, files: list[str]) -> list[str]:
+    from migration_agent.sandbox.runner import run_lint
+
+    return run_lint(repo_path, files)
 
 
 def _checkpoint(repo_path: str, message: str) -> str:
@@ -155,13 +228,16 @@ class Toolkit:
     propose_fix: Callable[..., Patch | None] = _propose_fix
     validate: Callable[[Patch, str], bool] = _validate
     build_context: Callable[[GraphMemory, str, int], str] = _build_context
-    run_tests: Callable[[str], TestReport] = _run_tests
+    #: (repository, stage) with stage SOURCE or TARGET
+    run_tests: Callable[[str, str], TestReport] = _run_tests
+    run_lint: Callable[[str, list[str]], list[str]] = _run_lint
     checkpoint: Callable[[str, str], str] = _checkpoint
     rollback: Callable[[str, str], None] = _rollback
     diagnose: Callable[..., list] = _diagnose
     is_oscillating: Callable[[list[str], str], bool] = _is_oscillating
     new_log: Callable[[], Log] = _new_log
     emit_patch: Callable[[str, str, Path], Path] = _emit_patch
+    llm_usage: Callable[[], dict[str, int]] = _llm_usage
 
 
 # ------------------------------------------------------------------ result
@@ -176,6 +252,8 @@ class RunResult:
     rolled_back_batches: list[int] = field(default_factory=list)
     steps: int = 0
     stopped_early: str = ""
+    #: The suite on the target version: True green, False regressed, None not run.
+    target_green: bool | None = None
     patch_path: Path | None = None
     output_dir: Path | None = None
 
@@ -194,6 +272,28 @@ def regressed(report: TestReport, baseline: TestReport) -> bool:
     return report.failed + report.errors > baseline.failed + baseline.errors
 
 
+def regressions(report: TestReport, baseline: TestReport) -> TestReport:
+    """``report`` without the failures the baseline already had, for diagnosis."""
+    known = _failing(baseline)
+    return dataclasses.replace(
+        report, failures=[f for f in report.failures if f.test_id not in known]
+    )
+
+
+_POSITION = re.compile(r"^(?P<path>[^:]+):\d+:\d+: ")
+
+
+def _lint_key(finding: str) -> str:
+    """A finding without its line and column, which an edit elsewhere in the file shifts."""
+    return _POSITION.sub(r"\g<path>: ", finding.strip())
+
+
+def new_findings(findings: list[str], baseline: list[str]) -> list[str]:
+    """Lint findings the baseline did not have."""
+    known = {_lint_key(f) for f in baseline}
+    return [f for f in findings if _lint_key(f) not in known]
+
+
 class _Run:
     """State of one migration run; :func:`run_migration` is the public entry point."""
 
@@ -204,6 +304,9 @@ class _Run:
         self.output_dir = output_dir
         self.log = tools.new_log()
         self.step = 0
+        self.baseline = TestReport()
+        self.lint_baseline: list[str] = []
+        self.usage_at_start = tools.llm_usage()
 
     def record(
         self,
@@ -231,6 +334,30 @@ class _Run:
 
     def over_budget(self) -> bool:
         return self.step >= self.config.max_steps
+
+    def broken(self, report: TestReport) -> bool:
+        """A test regressed against the baseline, or an edit added a lint finding."""
+        return regressed(report, self.baseline) or bool(report.lint_findings)
+
+    def verify(self, edited: list[str], batch_id: int, attempt: int) -> TestReport:
+        """Tests on the source version, plus lint of the edited files.
+
+        The report's ``lint_findings`` hold only the findings the edits added.
+        """
+        report = self.tools.run_tests(self.repo, SOURCE)
+        lint = self.tools.run_lint(self.repo, edited) if edited else []
+        report = dataclasses.replace(report, lint_findings=new_findings(lint, self.lint_baseline))
+        self.record(
+            "verification",
+            "tested",
+            batch_id=batch_id,
+            attempt=attempt,
+            passed=report.passed,
+            failed=report.failed,
+            errors=report.errors,
+            lint_findings=len(report.lint_findings),
+        )
+        return report
 
     # -------------------------------------------------------------- one batch
     def edit_file(self, path: str, memory: GraphMemory, rules: dict, batch_id: int) -> None:
@@ -286,16 +413,16 @@ class _Run:
     def repair(
         self,
         report: TestReport,
-        baseline: TestReport,
+        edited: list[str],
         analysis: AnalysisResult,
         memory: GraphMemory,
         batch_id: int,
     ) -> TestReport:
         history: list[str] = []
         for attempt in range(1, self.config.max_retries + 1):
-            if not regressed(report, baseline) or self.over_budget():
+            if not self.broken(report) or self.over_budget():
                 break
-            fixes = self.tools.diagnose(report, analysis, memory)
+            fixes = self.tools.diagnose(regressions(report, self.baseline), analysis, memory)
             self.record(
                 "correction", "diagnosed", batch_id=batch_id, attempt=attempt, fixes=len(fixes)
             )
@@ -304,8 +431,15 @@ class _Run:
                 if fix.file in memory:
                     memory.record_retry(fix.file)
                 context = self.tools.build_context(memory, fix.file, self.config.token_budget)
-                patch = self.tools.propose_fix(context, fix)
+                patch = self.tools.propose_fix(context, fix, self.repo)
                 if patch is None:
+                    self.record(
+                        "correction",
+                        "no_fix",
+                        batch_id=batch_id,
+                        files=[fix.file],
+                        status="skipped",
+                    )
                     continue
                 if self.tools.is_oscillating(history, patch.diff):
                     self.record(
@@ -328,16 +462,7 @@ class _Run:
                     )
             if not applied:
                 break
-            report = self.tools.run_tests(self.repo)
-            self.record(
-                "verification",
-                "tested",
-                batch_id=batch_id,
-                attempt=attempt,
-                passed=report.passed,
-                failed=report.failed,
-                errors=report.errors,
-            )
+            report = self.verify(edited, batch_id, attempt)
         return report
 
     # -------------------------------------------------------------- whole run
@@ -366,13 +491,17 @@ class _Run:
             return self.finish(result)
 
         memory = GraphMemory.from_analysis(analysis, self.repo)
-        baseline = tools.run_tests(self.repo)
+        self.baseline = baseline = tools.run_tests(self.repo, SOURCE)
+        # Only impacted files are ever edited, so only they need a lint baseline.
+        impacted = sorted(analysis.impact_set.files)
+        self.lint_baseline = tools.run_lint(self.repo, impacted) if impacted else []
         self.record(
             "verification",
             "baseline",
             passed=baseline.passed,
             failed=baseline.failed,
             errors=baseline.errors,
+            lint_findings=len(self.lint_baseline),
         )
         base_commit = tools.checkpoint(self.repo, "migration: before")
         rules = {rule.pattern_id: rule for rule in spec.replacement_rules}
@@ -386,19 +515,12 @@ class _Run:
             for path in batch.files:
                 if path in memory:
                     self.edit_file(path, memory, rules, batch.batch_id)
-            report = tools.run_tests(self.repo)
-            self.record(
-                "verification",
-                "tested",
-                batch_id=batch.batch_id,
-                attempt=0,
-                passed=report.passed,
-                failed=report.failed,
-                errors=report.errors,
-            )
-            report = self.repair(report, baseline, analysis, memory, batch.batch_id)
+            edited_now = set(memory.in_state(FileState.EDITED))
+            edited = [path for path in batch.files if path in edited_now]
+            report = self.verify(edited, batch.batch_id, attempt=0)
+            report = self.repair(report, edited, analysis, memory, batch.batch_id)
 
-            green = not regressed(report, baseline)
+            green = not self.broken(report)
             if green:
                 tools.checkpoint(self.repo, f"migration: batch {batch.batch_id} verified")
                 result.verified_batches.append(batch.batch_id)
@@ -419,6 +541,20 @@ class _Run:
             )
             memory.save(self.output_dir / "graph_memory.json")
 
+        if not result.stopped_early:
+            final = tools.run_tests(self.repo, TARGET)
+            result.target_green = not regressed(final, baseline)
+            result.success = result.success and result.target_green
+            self.record(
+                "verification",
+                "target_tested",
+                status="ok" if result.target_green else "failed",
+                passed=final.passed,
+                failed=final.failed,
+                errors=final.errors,
+                regressed=sorted(_failing(regressions(final, baseline))),
+            )
+
         result.patch_path = tools.emit_patch(
             self.repo, base_commit, self.output_dir / "migration.patch"
         )
@@ -432,10 +568,17 @@ class _Run:
             verified=result.verified_batches,
             rolled_back=result.rolled_back_batches,
             stopped_early=result.stopped_early,
+            target_green=result.target_green,
+            llm=self.llm_spent(),
         )
         result.steps = self.step
         self.log.save(self.output_dir / "trajectory.json")
         return result
+
+    def llm_spent(self) -> dict[str, int]:
+        """Model calls and tokens of this run (the shared client also counts earlier runs)."""
+        now = self.tools.llm_usage()
+        return {key: value - self.usage_at_start.get(key, 0) for key, value in now.items()}
 
 
 def run_migration(

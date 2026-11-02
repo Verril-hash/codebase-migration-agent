@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 # Every dependency is pinned. Add new ones here, pinned, in the same PR that uses them.
 dependencies = [
+    "anthropic==2.3.0",
     "libcst==1.9.0",
     "networkx==3.7",
 ]

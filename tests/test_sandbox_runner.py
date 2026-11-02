@@ -280,7 +280,7 @@ def test_the_archive_leaves_out_version_control_caches_and_virtualenvs(tmp_path:
     }
     for name, text in files.items():
         (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
-        (tmp_path / name).write_text(text, encoding="utf-8")
+        (tmp_path / name).write_bytes(text.encode("utf-8"))  # exact bytes on every OS
     buffer = io.BytesIO()
     names = write_archive(tmp_path, buffer)
     assert sorted(names) == ["app", "app/db.py", "tests", "tests/test_db.py"]
